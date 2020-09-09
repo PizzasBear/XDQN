@@ -1,4 +1,4 @@
-from typing import Tuple, Union, List
+from typing import Tuple, Union, List, Dict
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -109,31 +109,13 @@ class DuelingQNet(nn.Module):
 
 
 # noinspection PyAbstractClass
-class Actor(nn.Module):
-    net: nn.Module
-
-    def __init__(self, net: nn.Module):
-        super().__init__()
-        self.net = net
-
-    def act(self, obs: np.ndarray,
-            device: Union[None, str, torch.device]) -> Tuple[int, float]:
-        with torch.no_grad():
-            q: np.ndarray = self.net(
-                torch.tensor(
-                    obs, device=device).unsqueeze(0)).squeeze(0).cpu().numpy()
-            action: int = q.argmax()
-            return action, q[action]
-
-
-# noinspection PyAbstractClass
-class Agent(nn.Module):
+class Agent:
     net: nn.Module
     target_net: nn.Module
     buffer: per.PrioritisedReplayBuffer
     opt: optim.Optimizer
 
-    DISCOUNT: float
+    discount: float
 
     def __init__(
         self,
@@ -148,7 +130,6 @@ class Agent(nn.Module):
         per_alpha: float = per.ALPHA,
         per_beta: float = per.BETA,
         reward_scaling: float = per.REWARD_SCALING,
-        epsilon_greedy: float = EPSILON_GREEDY,
     ):
         super().__init__()
         self.net = net
@@ -162,7 +143,7 @@ class Agent(nn.Module):
             beta=per_beta,
             reward_scaling=reward_scaling)
         self.opt = optim.Adam(net.parameters(), lr=lr)
-        self.DISCOUNT = discount
+        self.discount = discount
 
     def update_target(self):
         self.target_net.load_state_dict(self.net.state_dict())
@@ -171,12 +152,75 @@ class Agent(nn.Module):
               reward: float, done: bool, next_obs: np.ndarray,
               device: Union[None, str, torch.device]) -> int:
         with torch.no_grad():
-            target_q = (reward + self.DISCOUNT * self.target_net(
-                torch.tensor(next_obs, device=device).unsqueeze(0)).max(
-                    1).unsqueeze(0).cpu().numpy() if not done else reward)
-        return self.buffer.push(prev_idx, target_q - q, obs, action, reward,
-                                done)
+            if done:
+                target_q = reward
+            else:
+                torch_next_obs = torch.tensor(next_obs,
+                                              device=device).unsqueeze(0)
+                next_q = self.target_net(torch_next_obs).max(
+                    1).squeeze().cpu().numpy()
+                target_q = reward + self.discount * next_q
+        return self.buffer.push(prev_idx, obs, action, reward, done,
+                                target_q - q)
 
-    def learn(self, rng: random.Generator, batch_size: int = BATCH_SIZE):
-        states, actions, rewards, masks, next_states = self.buffer.sample(
-            rng, batch_size)
+    def learn(self,
+              rng: random.Generator,
+              device: Union[None, str, torch.device],
+              batch_size: int = BATCH_SIZE,
+              n_step: int = 3):
+        obs, actions, rewards, masks, next_obs, weights, indices = self.buffer.sample(
+            rng, batch_size, self.discount, n_step)
+        obs = torch.tensor(obs, dtype=torch.float32, device=device)
+        actions = torch.tensor(actions, dtype=torch.int64, device=device)
+        rewards = torch.tensor(rewards, dtype=torch.float32, device=device)
+        masks = torch.tensor(masks, dtype=torch.bool, device=device)
+        next_obs = torch.tensor(next_obs, dtype=torch.float32, device=device)
+
+        next_actions: torch.Tensor = self.net(next_obs).argmax(1, True)
+        next_qs: torch.Tensor = self.target_net(next_obs).gather(
+            1, next_actions)
+        target_qs = rewards + masks * (self.discount**n_step) * next_qs
+        qs = self.net(obs).gather(1, actions.unsqueeze(1)).squeeze(1)
+        error = (qs - target_qs).detach().cpu().numpy()
+        self.buffer.update_priorities(indices, error)
+        huber_loss = (F.smooth_l1_loss(qs, next_qs, reduction='none') *
+                      weights).mean()
+
+        self.opt.zero_grad()
+        huber_loss.backward()
+        self.opt.step()
+
+    def state_dict(self) -> Dict[str, torch.Tensor]:
+        return self.net.state_dict()
+
+
+# noinspection PyAbstractClass
+class Actor:
+    net: nn.Module
+    epsilon_greedy: float
+
+    def __init__(
+        self,
+        net: nn.Module,
+        epsilon_greedy: float = EPSILON_GREEDY,
+    ):
+        super().__init__()
+        self.net = net
+        self.epsilon_greedy = epsilon_greedy
+
+    def act(self, obs: np.ndarray, rng: random.Generator,
+            device: Union[None, str, torch.device]) -> Tuple[int, float]:
+        with torch.no_grad():
+            q: np.ndarray = self.net(
+                torch.tensor(
+                    obs, device=device).unsqueeze(0)).squeeze(0).cpu().numpy()
+            if rng.random() < self.epsilon_greedy:
+                action: int = rng.integers(len(q))
+            else:
+                action: int = q.argmax()
+            return action, q[action]
+
+    def load_state_dict(self,
+                        state_dict: Dict[str, torch.Tensor],
+                        strict: bool = True):
+        self.net.load_state_dict(state_dict, strict)

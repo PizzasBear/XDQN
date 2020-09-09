@@ -94,23 +94,22 @@ class ReplayBuffer:
         self.prev_indices[idx] = prev_idx
         return idx
 
-    def _sample_indices(self, rng: random.Generator, batch_size: int, steps: int = 1) -> np.ndarray:
-        return rng.integers(0, self._len - steps, batch_size)
-
-    def sample(self, rng: random.Generator,
-               batch_size: int, discount: float, steps: int = 1) -> Tuple[np.ndarray, ...]:
-        indices = self._sample_indices(rng, batch_size, steps)
+    def sample(self,
+               rng: random.Generator,
+               batch_size: int,
+               discount: float,
+               steps: int = 1) -> Tuple[np.ndarray, ...]:
+        indices = rng.integers(0, self._len - steps, batch_size)
         rewards = self.rewards[indices]
         masks = self.masks[indices]
         i = indices
-        for _ in range(steps - 1):
-            i = self.next_indices[i]
-            rewards += masks * discount * self.rewards[i]
+        for j in range(steps - 1):
+            rewards += masks * (discount**j) * self.rewards[i]
             masks = np.all([masks, self.masks[i]], axis=0)
+            i = self.next_indices[i]
 
-        return (self.obs[indices], self.actions[indices],
-                rewards, masks,
-                self.obs[self.next_indices[i]], indices)
+        return (self.obs[indices], self.actions[indices], rewards, masks,
+                self.obs[i], indices)
 
 
 class PrioritisedReplayBuffer(ReplayBuffer):
@@ -136,26 +135,48 @@ class PrioritisedReplayBuffer(ReplayBuffer):
         self.beta = beta
 
     def _get_priority(self, err, epsilon=0.01):
-        return (np.abs(err) + epsilon)**-self.alpha
+        return (np.abs(err) + epsilon)**self.alpha
 
-    def push(self, prev_idx: int, obs: np.ndarray, action: int,
-             reward: float, done: bool, err: float = None) -> int:
+    def push(self,
+             prev_idx: int,
+             obs: np.ndarray,
+             action: int,
+             reward: float,
+             done: bool,
+             err: float = None) -> int:
         if err is None:
             raise RuntimeError
         idx = super().push(prev_idx, obs, action, reward, done)
         self.priorities[idx] = self._get_priority(err)
         return idx
 
-    def _sample_indices(self, rng: random.Generator, batch_size: int, steps: int = 1) -> np.ndarray:
-        indices = np.zeros(batch_size, dtype=np.int32)
-        for i in range(batch_size):
-            idx, _ = self.priorities.get(
-                rng.uniform(0., self.priorities.total()))
-            if self._current_index - steps <= idx < self._current_index:
-                idx = self._current_index - steps - 1
-            indices[i] = idx
-        return indices
-
     def update_priorities(self, indices, errs):
         for i, err in zip(indices, errs):
             self.priorities[i] = self._get_priority(err)
+
+    def sample(self,
+               rng: random.Generator,
+               batch_size: int,
+               discount: float,
+               steps: int = 1) -> Tuple[np.ndarray, ...]:
+        indices = np.zeros(batch_size, dtype=np.int32)
+        weights = np.zeros(batch_size, dtype=np.int32)
+        for i in range(batch_size):
+            idx, p = self.priorities.get(
+                rng.uniform(0., self.priorities.total()))
+            if self._current_index - steps <= idx < self._current_index:
+                idx = self._current_index - steps - 1
+            weights[i] = (self._len * p / self.priorities.total())**-self.beta
+            indices[i] = idx
+        weights /= weights.max(initial=0.01)
+
+        rewards = self.rewards[indices]
+        masks = self.masks[indices]
+        i = indices
+        for j in range(steps - 1):
+            rewards += masks * (discount**j) * self.rewards[i]
+            masks = np.all([masks, self.masks[i]], axis=0)
+            i = self.next_indices[i]
+
+        return (self.obs[indices], self.actions[indices], rewards, masks,
+                self.obs[i], weights, indices)
