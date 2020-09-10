@@ -25,6 +25,12 @@ class MultiConnection:
     def poll(self) -> List[int]:
         return [i for i, conn in enumerate(self.connections) if conn.poll(0)]
 
+    def poll_any(self) -> bool:
+        for conn in self.connections:
+            if conn.poll(0):
+                return True
+        return False
+
     def close(self):
         for conn in self.connections:
             conn.close()
@@ -61,11 +67,14 @@ class MultiReceiver:
         else:
             self.multi_conn = MultiConnection(multi_conn)
 
-    def recv(self) -> Optional[(int, object)]:
+    def recv(self) -> Optional[Tuple[int, object]]:
         return self.multi_conn.recv()
 
-    def poll(self) -> bool:
+    def poll(self) -> List[int]:
         return self.multi_conn.poll()
+
+    def poll_any(self) -> bool:
+        return self.multi_conn.poll_any()
 
     def close(self):
         return self.multi_conn.close()

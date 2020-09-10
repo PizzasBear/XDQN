@@ -83,7 +83,7 @@ def actor_proc(conn: mp.connection.Connection):
             fitness = 0.
         obs = next_obs
 
-        if conn.poll():
+        if conn.poll(0):
             key, value = conn.recv()
             if key == 'net':
                 actor.load_state_dict(value)
@@ -118,7 +118,7 @@ def learner_proc(conn: distrib.MultiConnection):
 
     # collect experience 'till the agent can learn
     while not agent.can_learn():
-        if conn.poll():
+        if conn.poll_any():
             idx, (key, value) = conn.recv()
             if key == 'buffer':
                 conn.send(('prev_idx', update_replay_buffer(agent, value)),
@@ -130,7 +130,7 @@ def learner_proc(conn: distrib.MultiConnection):
         if not t % ACTOR_UPDATE_INTERVAL:
             conn.send(('net', agent.state_dict()))
         # collect experience
-        if conn.poll():
+        if conn.poll_any():
             idx, (key, value) = conn.recv()
             if key == 'buffer':
                 conn.send(('prev_idx', update_replay_buffer(agent, value)),
