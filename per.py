@@ -43,6 +43,10 @@ class SumTree:
 
 
 class ReplayBuffer:
+    __slots__ = ('obs', 'actions', 'rewards', 'masks', 'next_indices',
+                 'prev_indices', 'reward_scaling', 'cap', '_len',
+                 '_current_index')
+
     # Buffers
     obs: np.ndarray
     actions: np.ndarray
@@ -54,8 +58,8 @@ class ReplayBuffer:
     reward_scaling: float
     # Buffer info
     cap: int
-    _len: int = 0
-    _current_index: int = 0
+    _len: int
+    _current_index: int
 
     def __init__(self,
                  cap: int,
@@ -72,6 +76,8 @@ class ReplayBuffer:
         self.next_indices = np.zeros(cap, dtype=np.int32)
 
         self.cap = cap
+        self._len = 0
+        self._current_index = 0
         self.reward_scaling = reward_scaling
 
     def __len__(self) -> int:
@@ -113,6 +119,8 @@ class ReplayBuffer:
 
 
 class PrioritisedReplayBuffer(ReplayBuffer):
+    __slots__ = 'priorities', 'alpha', 'beta'
+
     # Buffers
     priorities: SumTree
     # Hyper Params

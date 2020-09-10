@@ -1,11 +1,13 @@
-from typing import Tuple, Union, List, Dict
+from typing import Tuple, Union, List, Dict, overload, TypeVar, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.nn.init as init
 import torch.optim as optim
+from torch.utils.tensorboard import SummaryWriter
 import numpy as np
 from numpy import random
+
 import per
 
 LEARNING_RATE: float = 2e-4
@@ -13,11 +15,17 @@ REPLAY_CAPACITY: int = 2**19
 DISCOUNT: float = 0.99
 EPSILON_GREEDY: float = 0.1
 BATCH_SIZE: int = 64
+MIN_REPLAY_LEN: int = 4_000
+TARGET_UPDATE_INTERVAL: int = 1_000
+
+T = TypeVar('T')
+Device = Union[None, str, torch.device]
 
 
 # noinspection PyAbstractClass
 class MLP(nn.Module):
-    __constants__ = ['in_features', 'out_features']
+    __slots__ = 'layers', 'in_features', 'out_features'
+
     in_features: int
     out_features: int
     layers: nn.ModuleList
@@ -60,6 +68,8 @@ class MLP(nn.Module):
 
 # noinspection PyAbstractClass
 class ConvNet(nn.Module):
+    __slots__ = 'layers',
+
     layers: nn.ModuleList
 
     def __init__(self,
@@ -92,6 +102,8 @@ class ConvNet(nn.Module):
 
 # noinspection PyAbstractClass
 class DuelingQNet(nn.Module):
+    __slots__ = 'features_net', 'value_net', 'advantage_net'
+
     features_net: nn.Module
     value_net: nn.Module
     advantage_net: nn.Module
@@ -110,6 +122,8 @@ class DuelingQNet(nn.Module):
 
 # noinspection PyAbstractClass
 class Agent:
+    __slots__ = 'net', 'target_net', 'buffer', 'opt', 'discount'
+
     net: nn.Module
     target_net: nn.Module
     buffer: per.PrioritisedReplayBuffer
@@ -145,12 +159,13 @@ class Agent:
         self.opt = optim.Adam(net.parameters(), lr=lr)
         self.discount = discount
 
+    @torch.no_grad()
     def update_target(self):
         self.target_net.load_state_dict(self.net.state_dict())
 
     def store(self, prev_idx: int, q: float, obs: np.ndarray, action: int,
               reward: float, done: bool, next_obs: np.ndarray,
-              device: Union[None, str, torch.device]) -> int:
+              device: Device) -> int:
         with torch.no_grad():
             if done:
                 target_q = reward
@@ -163,11 +178,19 @@ class Agent:
         return self.buffer.push(prev_idx, obs, action, reward, done,
                                 target_q - q)
 
+    def can_learn(self) -> bool:
+        return MIN_REPLAY_LEN < len(self.buffer)
+
     def learn(self,
+              t: int,
+              writer: SummaryWriter,
               rng: random.Generator,
-              device: Union[None, str, torch.device],
+              device: Device,
               batch_size: int = BATCH_SIZE,
               n_step: int = 3):
+        if not self.can_learn():
+            return
+
         obs, actions, rewards, masks, next_obs, weights, indices = self.buffer.sample(
             rng, batch_size, self.discount, n_step)
         obs = torch.tensor(obs, dtype=torch.float32, device=device)
@@ -190,12 +213,39 @@ class Agent:
         huber_loss.backward()
         self.opt.step()
 
+        writer.add_scalar('Data/Loss', huber_loss, t)
+        if not t % TARGET_UPDATE_INTERVAL:
+            self.update_target()
+
     def state_dict(self) -> Dict[str, torch.Tensor]:
         return self.net.state_dict()
+
+    @overload
+    def to(self: T,
+           device: Optional[Union[int, torch.device]] = ...,
+           dtype: Optional[Union[torch.dtype, str]] = ...,
+           non_blocking: bool = ...) -> T:
+        ...
+
+    @overload
+    def to(self: T,
+           dtype: Union[torch.dtype, str],
+           non_blocking: bool = ...) -> T:
+        ...
+
+    @overload
+    def to(self: T, tensor: torch.Tensor, non_blocking: bool = ...) -> T:
+        ...
+
+    def to(self, *args, **kwargs):
+        self.net.to(*args, **kwargs)
+        self.target_net.to(*args, **kwargs)
+        return self
 
 
 # noinspection PyAbstractClass
 class Actor:
+    __slots__ = 'net', 'epsilon_greedy'
     net: nn.Module
     epsilon_greedy: float
 
@@ -209,7 +259,7 @@ class Actor:
         self.epsilon_greedy = epsilon_greedy
 
     def act(self, obs: np.ndarray, rng: random.Generator,
-            device: Union[None, str, torch.device]) -> Tuple[int, float]:
+            device: Device) -> Tuple[int, float]:
         with torch.no_grad():
             q: np.ndarray = self.net(
                 torch.tensor(
@@ -224,3 +274,24 @@ class Actor:
                         state_dict: Dict[str, torch.Tensor],
                         strict: bool = True):
         self.net.load_state_dict(state_dict, strict)
+
+    @overload
+    def to(self: T,
+           device: Optional[Union[int, torch.device]] = ...,
+           dtype: Optional[Union[torch.dtype, str]] = ...,
+           non_blocking: bool = ...) -> T:
+        ...
+
+    @overload
+    def to(self: T,
+           dtype: Union[torch.dtype, str],
+           non_blocking: bool = ...) -> T:
+        ...
+
+    @overload
+    def to(self: T, tensor: torch.Tensor, non_blocking: bool = ...) -> T:
+        ...
+
+    def to(self, *args, **kwargs):
+        self.net.to(*args, **kwargs)
+        return self
