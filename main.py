@@ -116,16 +116,20 @@ def learner_proc(conn: distrib.MultiConnection):
     writer: SummaryWriter = SummaryWriter(log_dir)
     rng: random.Generator = random.default_rng()
 
+    # collect experience 'till the agent can learn
     while not agent.can_learn():
         if conn.poll():
             idx, (key, value) = conn.recv()
             if key == 'buffer':
                 conn.send(('prev_idx', update_replay_buffer(agent, value)),
                           idx)
+    # start the learning loop
     for t in count(1):
         agent.learn(t, writer, rng, DEVICE)
+        # update the actor
         if not t % ACTOR_UPDATE_INTERVAL:
             conn.send(('net', agent.state_dict()))
+        # collect experience
         if conn.poll():
             idx, (key, value) = conn.recv()
             if key == 'buffer':
@@ -137,18 +141,12 @@ def learner_proc(conn: distrib.MultiConnection):
 
 def main():
     actor_conns, learner_conns = distrib.MultiPipe(NUM_ACTORS)
-    learner_handle = mp.Process(
-        target=learner_proc, args=(distrib.MultiConnection(learner_conns), ))
     actor_handles = [
         mp.Process(target=actor_proc, args=(conn, )) for conn in actor_conns
     ]
-    learner_handle.start()
     for actor_handle in actor_handles:
         actor_handle.start()
-
-    for actor_handle in actor_handles:
-        actor_handle.join()
-    learner_handle.join()
+    learner_proc(distrib.MultiConnection(learner_conns))
 
 
 if __name__ == '__main__':
