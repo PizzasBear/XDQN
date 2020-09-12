@@ -168,7 +168,7 @@ class PrioritisedReplayBuffer(ReplayBuffer):
                discount: float,
                steps: int = 1) -> Tuple[np.ndarray, ...]:
         indices = np.zeros(batch_size, dtype=np.int32)
-        weights = np.zeros(batch_size, dtype=np.int32)
+        weights = np.zeros(batch_size, dtype=np.float32)
         for i in range(batch_size):
             idx, p = self.priorities.get(
                 rng.uniform(0., self.priorities.total()))

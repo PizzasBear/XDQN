@@ -10,13 +10,17 @@ from numpy import random
 
 import per
 
-LEARNING_RATE: float = 2e-4
+LEARNING_RATE: float = 3e-4
 REPLAY_CAPACITY: int = 2**19
 DISCOUNT: float = 0.99
-EPSILON_GREEDY: float = 0.1
+EPSILON_HIGH: float = 0.5
+EPSILON_LOW: float = 0.1
+EPSILON_DECAY: float = 8e-4
 BATCH_SIZE: int = 64
 MIN_REPLAY_LEN: int = 4_000
 TARGET_UPDATE_INTERVAL: int = 1_000
+PER_BETA_INCREMENT: float = 5e-4
+NUM_QUANTILES: int = 50
 
 T = TypeVar('T')
 Device = Union[None, str, torch.device]
@@ -51,9 +55,9 @@ class MLP(nn.Module):
             prev_features = size
 
         if out_features is not None:
-            prev_features = out_features
             if isinstance(out_features, int):
                 self.layers.append(nn.Linear(prev_features, out_features))
+                prev_features = out_features
             else:
                 self.layers.append(nn.Linear(prev_features, out_features[0]))
                 self.layers.append(out_features[1])
@@ -145,7 +149,6 @@ class Agent:
         per_beta: float = per.BETA,
         reward_scaling: float = per.REWARD_SCALING,
     ):
-        super().__init__()
         self.net = net
         self.target_net = target_net
         self.update_target()
@@ -172,8 +175,8 @@ class Agent:
             else:
                 torch_next_obs = torch.tensor(next_obs,
                                               device=device).unsqueeze(0)
-                next_q = self.target_net(torch_next_obs).max(
-                    1).squeeze().cpu().numpy()
+                next_q = self.target_net(torch_next_obs).max(1).values.squeeze(
+                    0).cpu().numpy()
                 target_q = reward + self.discount * next_q
         return self.buffer.push(prev_idx, obs, action, reward, done,
                                 target_q - q)
@@ -191,31 +194,34 @@ class Agent:
         if not self.can_learn():
             return
 
-        obs, actions, rewards, masks, next_obs, weights, indices = self.buffer.sample(
-            rng, batch_size, self.discount, n_step)
+        (obs, actions, rewards, masks, next_obs, weights,
+         indices) = self.buffer.sample(rng, batch_size, self.discount, n_step)
         obs = torch.tensor(obs, dtype=torch.float32, device=device)
         actions = torch.tensor(actions, dtype=torch.int64, device=device)
         rewards = torch.tensor(rewards, dtype=torch.float32, device=device)
         masks = torch.tensor(masks, dtype=torch.bool, device=device)
         next_obs = torch.tensor(next_obs, dtype=torch.float32, device=device)
+        weights = torch.tensor(weights, dtype=torch.float32, device=device)
 
         next_actions: torch.Tensor = self.net(next_obs).argmax(1, True)
         next_qs: torch.Tensor = self.target_net(next_obs).gather(
-            1, next_actions)
+            1, next_actions).squeeze(1)
         target_qs = rewards + masks * (self.discount**n_step) * next_qs
         qs = self.net(obs).gather(1, actions.unsqueeze(1)).squeeze(1)
-        error = (qs - target_qs).detach().cpu().numpy()
+        error: np.ndarray = (qs - target_qs).detach().cpu().numpy()
         self.buffer.update_priorities(indices, error)
-        huber_loss = (F.smooth_l1_loss(qs, next_qs, reduction='none') *
+        huber_loss = (F.smooth_l1_loss(qs, target_qs, reduction='none') *
                       weights).mean()
 
         self.opt.zero_grad()
         huber_loss.backward()
         self.opt.step()
 
-        writer.add_scalar('Data/Loss', huber_loss, t)
+        writer.add_scalar('Data/Mean Abs Error', np.abs(error).mean(), t)
+        writer.add_scalar('Data/Median Error', np.median(error), t)
         if not t % TARGET_UPDATE_INTERVAL:
             self.update_target()
+        self.buffer.beta = min(1., self.buffer.beta + PER_BETA_INCREMENT)
 
     def state_dict(self) -> Dict[str, torch.Tensor]:
         return self.net.state_dict()
@@ -245,30 +251,38 @@ class Agent:
 
 # noinspection PyAbstractClass
 class Actor:
-    __slots__ = 'net', 'epsilon_greedy'
+    __slots__ = 'net', 'epsilon_decay', 'epsilon_low', 'epsilon_high'
     net: nn.Module
-    epsilon_greedy: float
+    epsilon_decay: float
+    epsilon_low: float
+    epsilon_high: float
 
     def __init__(
         self,
         net: nn.Module,
-        epsilon_greedy: float = EPSILON_GREEDY,
+        epsilon_high: float = EPSILON_HIGH,
+        epsilon_low: float = EPSILON_LOW,
+        epsilon_decay: float = EPSILON_DECAY,
     ):
-        super().__init__()
         self.net = net
-        self.epsilon_greedy = epsilon_greedy
+        self.epsilon_low = epsilon_low
+        self.epsilon_high = epsilon_high
+        self.epsilon_decay = epsilon_decay
 
-    def act(self, obs: np.ndarray, rng: random.Generator,
-            device: Device) -> Tuple[int, float]:
+    def get_epsilon(self, t: int):
+        return (self.epsilon_high - self.epsilon_low) * self.epsilon_decay ** t + self.epsilon_low
+
+    def act(self, obs: np.ndarray, t: Optional[int], rng: Optional[random.Generator],
+            device: Device = None, all_q: bool = False) -> Tuple[int, Union[float, np.ndarray]]:
         with torch.no_grad():
             q: np.ndarray = self.net(
                 torch.tensor(
                     obs, device=device).unsqueeze(0)).squeeze(0).cpu().numpy()
-            if rng.random() < self.epsilon_greedy:
+            if t is not None and rng is not None and 0 < self.epsilon_high and rng.random() < self.get_epsilon(t):
                 action: int = rng.integers(len(q))
             else:
                 action: int = q.argmax()
-            return action, q[action]
+            return action, q if all_q else q[action]
 
     def load_state_dict(self,
                         state_dict: Dict[str, torch.Tensor],
