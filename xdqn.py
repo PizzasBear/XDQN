@@ -125,7 +125,38 @@ class DuelingQNet(nn.Module):
 
 
 # noinspection PyAbstractClass
-class Agent:
+class QuantileQNet(nn.Module):
+    __slots__ = 'net', 'num_quantiles'
+    net: nn.Module
+    num_quantiles: int
+
+    def __init__(self, net: nn.Module, num_quantiles: int):
+        super().__init__()
+        self.net = net
+        self.num_quantiles = num_quantiles
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        qs = self.net(x)
+        return qs.view(-1,
+                       qs.size()[1] // self.num_quantiles, self.num_quantiles)
+
+
+# noinspection PyAbstractClass
+class QuantileDuelingQNet(DuelingQNet):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        features: torch.Tensor = self.features_net(x)
+        values: torch.Tensor = self.value_net(features).unsqueeze(
+            1)  # -1, 1, Q
+        num_quantiles: int = values.size()[2]
+        advantages: torch.Tensor = self.advantage_net(features)  # -1, A*Q
+        advantages = advantages.view(-1,
+                                     advantages.size()[1] // num_quantiles,
+                                     num_quantiles)  # -1, A, Q
+        return values + advantages - advantages.mean(1, True)  # -1, A, Q
+
+
+# noinspection PyAbstractClass
+class Agent(nn.Module):
     __slots__ = 'net', 'target_net', 'buffer', 'opt', 'discount'
 
     net: nn.Module
@@ -141,6 +172,7 @@ class Agent:
         target_net: nn.Module,
         obs_shape: Union[int, Tuple[int, ...]],
         *,
+        num_quantiles: int,
         lr: float = LEARNING_RATE,
         replay_cap: int = REPLAY_CAPACITY,
         obs_dtype: np.dtype = np.float32,
@@ -149,6 +181,7 @@ class Agent:
         per_beta: float = per.BETA,
         reward_scaling: float = per.REWARD_SCALING,
     ):
+        super().__init__()
         self.net = net
         self.target_net = target_net
         self.update_target()
@@ -161,6 +194,10 @@ class Agent:
             reward_scaling=reward_scaling)
         self.opt = optim.Adam(net.parameters(), lr=lr)
         self.discount = discount
+        tau0 = 0.5 / num_quantiles
+        self.tau = nn.Parameter(torch.linspace(tau0, 1 - tau0,
+                                               num_quantiles).view(1, -1, 1),
+                                requires_grad=False)  # 1, Q, 1
 
     @torch.no_grad()
     def update_target(self):
@@ -175,8 +212,8 @@ class Agent:
             else:
                 torch_next_obs = torch.tensor(next_obs,
                                               device=device).unsqueeze(0)
-                next_q = self.target_net(torch_next_obs).max(1).values.squeeze(
-                    0).cpu().numpy()
+                next_q = self.target_net(torch_next_obs).squeeze(0).mean(
+                    1).max(0).values.cpu().numpy()
                 target_q = reward + self.discount * next_q
         return self.buffer.push(prev_idx, obs, action, reward, done,
                                 target_q - q)
@@ -203,50 +240,42 @@ class Agent:
         next_obs = torch.tensor(next_obs, dtype=torch.float32, device=device)
         weights = torch.tensor(weights, dtype=torch.float32, device=device)
 
-        next_actions: torch.Tensor = self.net(next_obs).argmax(1, True)
-        next_qs: torch.Tensor = self.target_net(next_obs).gather(
-            1, next_actions).squeeze(1)
-        target_qs = rewards + masks * (self.discount**n_step) * next_qs
-        qs = self.net(obs).gather(1, actions.unsqueeze(1)).squeeze(1)
-        error: np.ndarray = (qs - target_qs).detach().cpu().numpy()
-        self.buffer.update_priorities(indices, error)
-        huber_loss = (F.smooth_l1_loss(qs, target_qs, reduction='none') *
-                      weights).mean()
+        next_qs: torch.Tensor = self.net(next_obs)
+        num_quantiles = next_qs.size()[2]
+        next_actions: torch.Tensor = next_qs.mean(2,
+                                                  True).argmax(1, True).expand(
+                                                      -1, 1, num_quantiles)
+        next_qs = self.target_net(next_obs).gather(1, next_actions)  # -1, 1, Q
+        target_qs = rewards.view(-1, 1, 1) + masks.view(
+            -1, 1, 1) * (self.discount**n_step) * next_qs  # -1, 1, Q
+        qs = self.net(obs)  # -1, A, Q
+        qs = qs.gather(1,
+                       actions.view(-1, 1,
+                                    1).expand(-1, 1, num_quantiles)).view(
+                                        -1, num_quantiles, 1)  # -1, Q, 1
+        error: torch.Tensor = qs - target_qs  # -1, Q, Q
+        tau_weights = (self.tau -
+                       (error.detach() < 0).float()).abs()  # -1, Q, Q
+        priorities: np.ndarray = (error.detach().abs() * tau_weights).mean(
+            (1, 2)).cpu().numpy()  # -1
+        loss = (
+            (F.smooth_l1_loss(qs.expand(-1, -1, num_quantiles),
+                              target_qs.expand(-1, num_quantiles, -1),
+                              reduction='none') * tau_weights).mean(2).sum(1) *
+            weights).mean()
 
         self.opt.zero_grad()
-        huber_loss.backward()
+        loss.backward()
         self.opt.step()
 
-        writer.add_scalar('Data/Mean Abs Error', np.abs(error).mean(), t)
-        writer.add_scalar('Data/Median Error', np.median(error), t)
+        self.buffer.update_priorities(indices, priorities)
+        writer.add_scalar('Data/Mean Abs Error', priorities.mean(), t)
         if not t % TARGET_UPDATE_INTERVAL:
             self.update_target()
         self.buffer.beta = min(1., self.buffer.beta + PER_BETA_INCREMENT)
 
-    def state_dict(self) -> Dict[str, torch.Tensor]:
+    def net_state_dict(self) -> Dict[str, torch.Tensor]:
         return self.net.state_dict()
-
-    @overload
-    def to(self: T,
-           device: Optional[Union[int, torch.device]] = ...,
-           dtype: Optional[Union[torch.dtype, str]] = ...,
-           non_blocking: bool = ...) -> T:
-        ...
-
-    @overload
-    def to(self: T,
-           dtype: Union[torch.dtype, str],
-           non_blocking: bool = ...) -> T:
-        ...
-
-    @overload
-    def to(self: T, tensor: torch.Tensor, non_blocking: bool = ...) -> T:
-        ...
-
-    def to(self, *args, **kwargs):
-        self.net.to(*args, **kwargs)
-        self.target_net.to(*args, **kwargs)
-        return self
 
 
 # noinspection PyAbstractClass
@@ -270,18 +299,29 @@ class Actor:
         self.epsilon_decay = epsilon_decay
 
     def get_epsilon(self, t: int):
-        return (self.epsilon_high - self.epsilon_low) * self.epsilon_decay ** t + self.epsilon_low
+        return (self.epsilon_high -
+                self.epsilon_low) * self.epsilon_decay**t + self.epsilon_low
 
-    def act(self, obs: np.ndarray, t: Optional[int], rng: Optional[random.Generator],
-            device: Device = None, all_q: bool = False) -> Tuple[int, Union[float, np.ndarray]]:
+    def act(self,
+            obs: np.ndarray,
+            t: Optional[int],
+            rng: Optional[random.Generator],
+            device: Device = None,
+            all_q: bool = False,
+            epsilon: Optional[float] = None) -> Tuple[int, Union[float, np.ndarray]]:
         with torch.no_grad():
             q: np.ndarray = self.net(
-                torch.tensor(
-                    obs, device=device).unsqueeze(0)).squeeze(0).cpu().numpy()
-            if t is not None and rng is not None and 0 < self.epsilon_high and rng.random() < self.get_epsilon(t):
-                action: int = rng.integers(len(q))
-            else:
-                action: int = q.argmax()
+                torch.tensor(obs,
+                             device=device).unsqueeze(0)).squeeze(0)  # A, Q
+            q = q.mean(1).cpu().numpy()  # A
+            action: Optional[int] = None
+            if rng is not None:
+                if epsilon is None and t is not None and 0 < self.epsilon_high:
+                    epsilon = self.get_epsilon(t)
+                if epsilon is not None and rng.random() < epsilon:
+                    action = rng.integers(len(q))
+            if action is None:
+                action = q.argmax()
             return action, q if all_q else q[action]
 
     def load_state_dict(self,
@@ -309,3 +349,13 @@ class Actor:
     def to(self, *args, **kwargs):
         self.net.to(*args, **kwargs)
         return self
+
+
+def bellman_h(x: torch.Tensor, epsilon: float = 0.02) -> torch.Tensor:
+    return torch.sign(x) * ((x.abs() + 1).sqrt() - 1) + epsilon * x
+
+
+def bellman_ih(x: torch.Tensor, epsilon: float = 0.02) -> torch.Tensor:
+    return torch.sign(x) * (((1 + 4 * epsilon *
+                              (x.abs() + 1 + epsilon)).sqrt() - 1).square() *
+                            (1 / (2 * epsilon))**2 - 1)

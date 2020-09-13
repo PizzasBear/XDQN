@@ -1,7 +1,7 @@
-import dqn
+import xdqn
 import distrib
 import traceback
-from typing import Dict
+from typing import Dict, Optional
 from datetime import datetime
 from itertools import count
 import numpy as np
@@ -13,9 +13,9 @@ from multiprocessing.connection import Connection
 import gym
 
 NUM_ACTORS: int = 10
-ACTOR_UPDATE_INTERVAL: int = 500
+ACTOR_UPDATE_INTERVAL: int = 293
 SAVE_INTERVAL: int = 1000
-REPLAY_BUFFER_UPDATE_INTERVAL: int = 500
+REPLAY_BUFFER_UPDATE_INTERVAL: int = 223
 IN_FEATURES: int = 8
 NUM_ACTIONS: int = 4
 ENV_ID: str = 'LunarLander-v2'
@@ -23,6 +23,8 @@ LEARNER_DEVICE: str = 'cuda'
 ACTOR_DEVICE: str = 'cpu'
 LOG_DIR: str = 'lunar-lander/'
 MODEL_FILE: str = 'lunar-lander.pt'
+BASE_EPSILON: float = 0.4
+EPSILON_ALPHA: float = 7.
 
 
 def make_env():
@@ -50,17 +52,17 @@ class ActorBuffer:
 
 
 def make_net(in_features: int, num_actions: int):
-    net = dqn.DuelingQNet(
-        dqn.MLP([64], in_features),
-        dqn.MLP([48], 64, out_features=1),
-        dqn.MLP([48], 64, out_features=num_actions),
+    net = xdqn.QuantileDuelingQNet(
+        xdqn.MLP([64], in_features),
+        xdqn.MLP([48], 64, out_features=xdqn.NUM_QUANTILES),
+        xdqn.MLP([48], 64, out_features=num_actions * xdqn.NUM_QUANTILES),
     )
     return net
 
 
-def actor_proc(conn: Connection):
+def actor_proc(conn: Connection, epsilon: Optional[float] = None):
     try:
-        actor = dqn.Actor(make_net(IN_FEATURES, NUM_ACTIONS)).to(ACTOR_DEVICE)
+        actor = xdqn.Actor(make_net(IN_FEATURES, NUM_ACTIONS)).to(ACTOR_DEVICE)
         actor.load_state_dict(conn.recv())
         rng: random.Generator = random.default_rng()
         env: gym.Env = make_env()
@@ -81,7 +83,7 @@ def actor_proc(conn: Connection):
         for t in count():
             i = t % REPLAY_BUFFER_UPDATE_INTERVAL
             # Play
-            action, q = actor.act(obs, t, rng, ACTOR_DEVICE)
+            action, q = actor.act(obs, t, rng, ACTOR_DEVICE, epsilon=epsilon)
             next_obs, reward, done, _ = env.step(action)
 
             # Send
@@ -129,7 +131,9 @@ def actor_proc(conn: Connection):
         conn.send(('except', (e, traceback.format_exc())))
 
 
-def update_replay_buffer(agent: dqn.Agent, buff: ActorBuffer, device: dqn.Device = LEARNER_DEVICE) -> int:
+def update_replay_buffer(agent: xdqn.Agent,
+                         buff: ActorBuffer,
+                         device: xdqn.Device = LEARNER_DEVICE) -> int:
     prev_idx = buff.prev_idx
     for i in range(REPLAY_BUFFER_UPDATE_INTERVAL):
         prev_idx = agent.store(prev_idx,
@@ -143,19 +147,21 @@ def update_replay_buffer(agent: dqn.Agent, buff: ActorBuffer, device: dqn.Device
     return prev_idx
 
 
-def state_dict_to_cpu(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+def state_dict_to_cpu(
+        state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
     for k, v in state_dict.items():
         state_dict[k] = v.cpu()
     return state_dict
 
 
 def learner_proc(conn: distrib.MultiConnection):
-    agent = dqn.Agent(
+    agent = xdqn.Agent(
         make_net(IN_FEATURES, NUM_ACTIONS),
         make_net(IN_FEATURES, NUM_ACTIONS),
         IN_FEATURES,
+        num_quantiles=xdqn.NUM_QUANTILES,
     ).to(LEARNER_DEVICE)
-    conn.send(state_dict_to_cpu(agent.state_dict()))
+    conn.send(state_dict_to_cpu(agent.net_state_dict()))
 
     log_dir: str = 'data/logs/' + LOG_DIR + datetime.now().strftime(
         '%Y%m%d-%H%M%S')
@@ -176,9 +182,9 @@ def learner_proc(conn: distrib.MultiConnection):
         agent.learn(t, writer, rng, LEARNER_DEVICE)
         # update the actor
         if not t % ACTOR_UPDATE_INTERVAL:
-            conn.send(('net', state_dict_to_cpu(agent.state_dict())))
+            conn.send(('net', state_dict_to_cpu(agent.net_state_dict())))
         if not t % SAVE_INTERVAL:
-            torch.save(agent.state_dict(), 'models/' + MODEL_FILE)
+            torch.save(agent.net_state_dict(), 'models/' + MODEL_FILE)
         # collect experience
         if conn.poll(0):
             idx, (key, value) = conn.recv()
@@ -194,9 +200,10 @@ def learner_proc(conn: distrib.MultiConnection):
 
 def main():
     actor_conns, learner_conns = distrib.MultiPipe(NUM_ACTORS)
+    actor_epsilons = BASE_EPSILON ** (1 + np.arange(NUM_ACTORS) * EPSILON_ALPHA / (NUM_ACTORS - 1))
     actor_handles = [
-        mp.Process(target=actor_proc, args=(conn, ), daemon=True)
-        for conn in actor_conns
+        mp.Process(target=actor_proc, args=(conn, epsilon), daemon=True)
+        for conn, epsilon in zip(actor_conns, actor_epsilons)
     ]
     for actor_handle in actor_handles:
         actor_handle.start()

@@ -4,7 +4,7 @@ from numpy import random
 
 ALPHA: float = 0.6
 BETA: float = 0.4
-REWARD_SCALING: float = 1.
+REWARD_SCALING: float = 5.
 
 
 class SumTree:

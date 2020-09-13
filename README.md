@@ -1,2 +1,1 @@
-# XDQN
-An extended version of DQN (Dueling, Double, ...)
+# XDQN (Extended DQN)* [DQN](https://arxiv.org/abs/1312.5602)* [Double DQN](https://arxiv.org/abs/1509.06461)* [Dueling Nets](https://arxiv.org/abs/1511.06581)* [Prioritized Experience Replay](https://arxiv.org/abs/1511.05952)* [Ape-X](https://arxiv.org/pdf/1803.00933.pdf)* [Quantile Regression DQN](https://arxiv.org/abs/1710.10044)
