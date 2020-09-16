@@ -302,13 +302,15 @@ class Actor:
         return (self.epsilon_high -
                 self.epsilon_low) * self.epsilon_decay**t + self.epsilon_low
 
-    def act(self,
-            obs: np.ndarray,
-            t: Optional[int],
-            rng: Optional[random.Generator],
-            device: Device = None,
-            all_q: bool = False,
-            epsilon: Optional[float] = None) -> Tuple[int, Union[float, np.ndarray]]:
+    def act(
+        self,
+        obs: np.ndarray,
+        t: Optional[int],
+        rng: Optional[random.Generator],
+        device: Device = None,
+        all_q: bool = False,
+        epsilon: Optional[float] = None
+    ) -> Tuple[int, Union[float, np.ndarray]]:
         with torch.no_grad():
             q: np.ndarray = self.net(
                 torch.tensor(obs,

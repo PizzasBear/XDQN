@@ -100,22 +100,32 @@ class ReplayBuffer:
         self.prev_indices[idx] = prev_idx
         return idx
 
-    def sample(self,
-               rng: random.Generator,
-               batch_size: int,
-               discount: float,
-               steps: int = 1) -> Tuple[np.ndarray, ...]:
-        indices = rng.integers(0, self._len - steps, batch_size)
+    def sample_indices(self,
+                       indices: np.ndarray,
+                       batch_size: int,
+                       discount: float,
+                       steps: int = 1) -> Tuple[np.ndarray, ...]:
+        # obs = np.empty((batch_size, steps, *self.obs.shape[1:]))
         rewards = self.rewards[indices]
         masks = self.masks[indices]
-        i = indices
+        i = self.next_indices[indices]
         for j in range(steps - 1):
             rewards += masks * (discount**j) * self.rewards[i]
             masks = np.all([masks, self.masks[i]], axis=0)
             i = self.next_indices[i]
 
         return (self.obs[indices], self.actions[indices], rewards, masks,
-                self.obs[i], indices)
+                self.obs[i])
+
+    # noinspection DuplicatedCode
+    def sample(self,
+               rng: random.Generator,
+               batch_size: int,
+               discount: float,
+               steps: int = 1) -> Tuple[np.ndarray, ...]:
+        indices = rng.integers(0, self._len - steps, batch_size)
+        return (*self.sample_indices(indices, batch_size, discount, steps),
+                indices)
 
 
 class PrioritisedReplayBuffer(ReplayBuffer):
@@ -162,6 +172,7 @@ class PrioritisedReplayBuffer(ReplayBuffer):
         for i, err in zip(indices, errs):
             self.priorities[i] = self._get_priority(err)
 
+    # noinspection DuplicatedCode
     def sample(self,
                rng: random.Generator,
                batch_size: int,
@@ -178,13 +189,5 @@ class PrioritisedReplayBuffer(ReplayBuffer):
             indices[i] = idx
         weights /= weights.max(initial=0.01)
 
-        rewards = self.rewards[indices]
-        masks = self.masks[indices]
-        i = indices
-        for j in range(steps - 1):
-            rewards += masks * (discount**j) * self.rewards[i]
-            masks = np.all([masks, self.masks[i]], axis=0)
-            i = self.next_indices[i]
-
-        return (self.obs[indices], self.actions[indices], rewards, masks,
-                self.obs[i], weights, indices)
+        return (*self.sample_indices(indices, batch_size, discount, steps),
+                weights, indices)

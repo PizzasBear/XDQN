@@ -25,6 +25,7 @@ LOG_DIR: str = 'lunar-lander/'
 MODEL_FILE: str = 'lunar-lander.pt'
 BASE_EPSILON: float = 0.4
 EPSILON_ALPHA: float = 7.
+CONTINUE: bool = False
 
 
 def make_env():
@@ -155,8 +156,11 @@ def state_dict_to_cpu(
 
 
 def learner_proc(conn: distrib.MultiConnection):
+    net = make_net(IN_FEATURES, NUM_ACTIONS)
+    if CONTINUE:
+        net.load_state_dict(torch.load('models/' + MODEL_FILE))
     agent = xdqn.Agent(
-        make_net(IN_FEATURES, NUM_ACTIONS),
+        net,
         make_net(IN_FEATURES, NUM_ACTIONS),
         IN_FEATURES,
         num_quantiles=xdqn.NUM_QUANTILES,
@@ -200,7 +204,8 @@ def learner_proc(conn: distrib.MultiConnection):
 
 def main():
     actor_conns, learner_conns = distrib.MultiPipe(NUM_ACTORS)
-    actor_epsilons = BASE_EPSILON ** (1 + np.arange(NUM_ACTORS) * EPSILON_ALPHA / (NUM_ACTORS - 1))
+    actor_epsilons = BASE_EPSILON**(1 + np.arange(NUM_ACTORS) * EPSILON_ALPHA /
+                                    (NUM_ACTORS - 1))
     actor_handles = [
         mp.Process(target=actor_proc, args=(conn, epsilon), daemon=True)
         for conn, epsilon in zip(actor_conns, actor_epsilons)
