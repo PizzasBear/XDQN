@@ -1,3 +1,4 @@
 /data/
-/data/logs
+/data/logs/
 /models/old/
+/__pycache__/
