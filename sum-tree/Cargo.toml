@@ -1,0 +1,15 @@
+[package]
+name = "sum-tree"
+version = "0.1.0"
+authors = ["max <mx.sht06@gmail.com>"]
+edition = "2018"
+
+[lib]
+name="sum_tree"
+crate-type = ["cdylib"]
+
+[package.metadata.maturin.scripts]
+SumTree = "sum_tree:SumTree"
+
+[dependencies]
+pyo3 = { version = "0.11", features = ["extension-module"] }

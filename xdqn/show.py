@@ -6,11 +6,11 @@ from matplotlib import pyplot as plt
 from matplotlib.patches import Rectangle
 import torch
 from typing import List
-import per
-from train import SAVE_INTERVAL, MODEL_FILE, IN_FEATURES, NUM_ACTIONS, make_net, make_env
-import xdqn
+from xdqn import algo
+from xdqn.buffers import REWARD_SCALING
+from xdqn.train import SAVE_INTERVAL, MODEL_FILE, IN_FEATURES, NUM_ACTIONS, make_net, make_env
 
-Q_UPDATE_INTERVAL: int = 6
+Q_UPDATE_INTERVAL: int = 3
 LOAD_INTERVAL: int = SAVE_INTERVAL
 AVG_FITNESS_SPEED: float = 0.1
 ADDITIONAL_SPACE: float = 0.05
@@ -22,7 +22,8 @@ action_info: gym.spaces.Discrete = env.action_space
 env.render()
 # noinspection PyTypeChecker
 actor = make_net(IN_FEATURES, NUM_ACTIONS)
-actor = xdqn.Actor(actor, 0.)
+actor = algo.Actor(actor)
+mem = actor.init_mem(1, 'cpu')
 obs: np.ndarray = env.reset()
 
 fig: plt.Figure = plt.figure()
@@ -31,7 +32,7 @@ ax1, ax2 = fig.subplots(ncols=2)
 min_q, max_q = -20., 20.
 min_advantage, max_advantage = -1., 1.
 
-first_fitness: bool = True
+first_episode: bool = True
 fitness: float = 0.
 avg_fitness: float = 0.
 q_bars: List[Rectangle] = ax1.bar(range(NUM_ACTIONS + 2),
@@ -45,16 +46,17 @@ fig.show()
 
 for t in cycle(range(LOAD_INTERVAL)):
     if not t:
+        print('reloading...')
         actor.load_state_dict(torch.load('models/' + MODEL_FILE))
     if env.render() is False:
         break
-    action, qs = actor.act(obs, None, None, 'cpu', True)
+    action, qs, mem = actor.act(mem, obs, None, get_q=True)
     advantages = qs - qs.mean()
     obs, reward, done, _ = env.step(action)
     fitness += reward
     if not t % Q_UPDATE_INTERVAL:
-        advantages *= per.REWARD_SCALING
-        qs *= per.REWARD_SCALING
+        advantages *= REWARD_SCALING
+        qs *= REWARD_SCALING
         for i, (q, q_bar, advantage, advantage_bar) in enumerate(
                 zip(qs, q_bars[2:], advantages, advantage_bars)):
             q_bar.set_height(q)
@@ -62,11 +64,13 @@ for t in cycle(range(LOAD_INTERVAL)):
             advantage_bar.set_height(advantage)
             advantage_bar.set_color('tab:blue')
         q_bars[1].set_height(qs.mean())
-        q_bars[0].set_height(avg_fitness)
-        q_bars[action + 1].set_color('tab:orange')
+        if first_episode:
+            avg_fitness = fitness
+        q_bars[0].set_height(avg_fitness - fitness)
+        q_bars[action + 2].set_color('tab:orange')
         advantage_bars[action].set_color('tab:orange')
-        min_q = qs.min(initial=min(min_q, avg_fitness))
-        max_q = qs.max(initial=max(max_q, avg_fitness))
+        min_q = qs.min(initial=min(min_q, avg_fitness - fitness))
+        max_q = qs.max(initial=max(max_q, avg_fitness - fitness))
         min_advantage = advantages.min(initial=min_advantage)
         max_advantage = advantages.max(initial=max_advantage)
         ax1.set_ylim(min_q + (min_q - max_q) * ADDITIONAL_SPACE,
@@ -77,11 +81,12 @@ for t in cycle(range(LOAD_INTERVAL)):
         fig.canvas.draw()
 
     if done:
-        print(f'fitness: {fitness}')
+        print(f'fitness: {fitness} ~ {avg_fitness}')
+        mem = actor.init_mem(1, 'cpu')
         obs = env.reset()
-        if first_fitness:
+        if first_episode:
             avg_fitness = fitness
-            first_fitness = False
+            first_episode = False
         else:
             avg_fitness *= 1 - AVG_FITNESS_SPEED
             avg_fitness += fitness * AVG_FITNESS_SPEED

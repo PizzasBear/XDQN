@@ -1,5 +1,4 @@
-import xdqn
-import distrib
+from xdqn import nets, algo, distrib, buffers
 import traceback
 from typing import Dict, Optional
 from datetime import datetime
@@ -32,88 +31,55 @@ def make_env():
     return gym.make(ENV_ID)
 
 
-class ActorBuffer:
-    __slots__ = ('prev_idx', 'obs', 'actions', 'qs', 'rewards', 'dones')
-
-    prev_idx: int
-    obs: np.ndarray
-    actions: np.ndarray
-    qs: np.ndarray
-    rewards: np.ndarray
-    dones: np.ndarray
-
-    def __init__(self, prev_idx: int, obs: np.ndarray, actions: np.ndarray,
-                 qs: np.ndarray, rewards: np.ndarray, dones: np.ndarray):
-        self.prev_idx = prev_idx
-        self.obs = obs
-        self.actions = actions
-        self.qs = qs
-        self.rewards = rewards
-        self.dones = dones
-
-
 def make_net(in_features: int, num_actions: int):
-    net = xdqn.QuantileDuelingQNet(
-        xdqn.MLP([64], in_features),
-        xdqn.MLP([48], 64, out_features=xdqn.NUM_QUANTILES),
-        xdqn.MLP([48], 64, out_features=num_actions * xdqn.NUM_QUANTILES),
+    net = nets.QuantileDuelingQNet(
+        feature_net=nets.MLP([64], in_features),
+        memory_net=nets.LSTM([64], 64),
+        value_net=nets.MLP([48], 64, out_features=algo.NUM_QUANTILES),
+        advantage_net=nets.MLP([48],
+                               64,
+                               out_features=num_actions * algo.NUM_QUANTILES),
     )
     return net
 
 
 def actor_proc(conn: Connection, epsilon: Optional[float] = None):
     try:
-        actor = xdqn.Actor(make_net(IN_FEATURES, NUM_ACTIONS)).to(ACTOR_DEVICE)
+        actor = algo.Actor(make_net(IN_FEATURES, NUM_ACTIONS)).to(ACTOR_DEVICE)
         actor.load_state_dict(conn.recv())
         rng: random.Generator = random.default_rng()
         env: gym.Env = make_env()
         obs: np.ndarray = env.reset()
-        buffer = ActorBuffer(
-            0,
-            np.zeros((REPLAY_BUFFER_UPDATE_INTERVAL + 1, IN_FEATURES),
-                     dtype=np.float32),
-            np.zeros(REPLAY_BUFFER_UPDATE_INTERVAL, dtype=np.int32),
-            np.zeros(REPLAY_BUFFER_UPDATE_INTERVAL, dtype=np.float32),
-            np.zeros(REPLAY_BUFFER_UPDATE_INTERVAL, dtype=np.float32),
-            np.zeros(REPLAY_BUFFER_UPDATE_INTERVAL, dtype=np.bool),
+        mem = actor.init_mem(1, 'cpu')
+
+        buffer = buffers.RecurrentActorBuffer(
+            REPLAY_BUFFER_UPDATE_INTERVAL,
+            IN_FEATURES,
+            actor.mem_size(),
         )
 
-        can_send = False
         can_send_fitness = False
         fitness = 0.
-        for t in count():
-            i = t % REPLAY_BUFFER_UPDATE_INTERVAL
+        while True:
             # Play
-            action, q = actor.act(obs, t, rng, ACTOR_DEVICE, epsilon=epsilon)
+            action, mem = actor.act(mem,
+                                    obs,
+                                    rng,
+                                    ACTOR_DEVICE,
+                                    epsilon=epsilon)
             next_obs, reward, done, _ = env.step(action)
 
             # Send
-            if not i and can_send:
-                buffer.obs[-1] = next_obs
+            if buffer.can_send():
                 conn.send(('buffer', buffer))
-                while True:
-                    key, value = conn.recv()
-                    if key == 'prev_idx':
-                        buffer.prev_idx = value
-                        break
-                    elif key == 'net':
-                        actor.load_state_dict(value)
-                    elif key == 'send_fitness':
-                        can_send_fitness = True
-                    else:
-                        raise RuntimeError
+                buffer.clear()
 
-            # Save to buffer
-            buffer.obs[i] = obs
-            buffer.actions[i] = action
-            buffer.qs[i] = q
-            buffer.rewards[i] = reward
-            buffer.dones[i] = done
+            buffer.push(obs, action, reward, done, mem)
 
             # Update obs and fitness
-            can_send = True
             fitness += reward
             if done:
+                mem = actor.init_mem(1, 'cpu')
                 if can_send_fitness:
                     conn.send(('fitness', fitness))  # send fitness
                 next_obs = env.reset()
@@ -132,22 +98,6 @@ def actor_proc(conn: Connection, epsilon: Optional[float] = None):
         conn.send(('except', (e, traceback.format_exc())))
 
 
-def update_replay_buffer(agent: xdqn.Agent,
-                         buff: ActorBuffer,
-                         device: xdqn.Device = LEARNER_DEVICE) -> int:
-    prev_idx = buff.prev_idx
-    for i in range(REPLAY_BUFFER_UPDATE_INTERVAL):
-        prev_idx = agent.store(prev_idx,
-                               buff.qs[i],
-                               buff.obs[i],
-                               buff.actions[i],
-                               buff.rewards[i],
-                               buff.dones[i],
-                               buff.obs[i + 1],
-                               device=device)
-    return prev_idx
-
-
 def state_dict_to_cpu(
         state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
     for k, v in state_dict.items():
@@ -159,11 +109,13 @@ def learner_proc(conn: distrib.MultiConnection):
     net = make_net(IN_FEATURES, NUM_ACTIONS)
     if CONTINUE:
         net.load_state_dict(torch.load('models/' + MODEL_FILE))
-    agent = xdqn.Agent(
+    agent = algo.Agent(
         net,
         make_net(IN_FEATURES, NUM_ACTIONS),
+        NUM_ACTORS,
         IN_FEATURES,
-        num_quantiles=xdqn.NUM_QUANTILES,
+        net.mem_size(),
+        num_quantiles=algo.NUM_QUANTILES,
     ).to(LEARNER_DEVICE)
     conn.send(state_dict_to_cpu(agent.net_state_dict()))
 
@@ -176,7 +128,7 @@ def learner_proc(conn: distrib.MultiConnection):
     while not agent.can_learn():
         idx, (key, value) = conn.recv()
         if key == 'buffer':
-            conn.send(('prev_idx', update_replay_buffer(agent, value)), idx)
+            agent.load(idx, value)
         elif key == 'except':
             print(value[1])
             raise value[0]
@@ -193,8 +145,7 @@ def learner_proc(conn: distrib.MultiConnection):
         if conn.poll(0):
             idx, (key, value) = conn.recv()
             if key == 'buffer':
-                conn.send(('prev_idx', update_replay_buffer(agent, value)),
-                          idx)
+                agent.load(idx, value)
             elif key == 'fitness':
                 writer.add_scalar('Fitness', value, t)
             elif key == 'except':
