@@ -1,88 +1,73 @@
-from typing import Tuple, Union, Iterable
+from typing import Tuple, Union, Iterable, Optional, Callable, List
 import numpy as np
 from numpy import random
 from sum_tree import SumTree
-import torch
+# import torch
 from xdqn.consts import *
 
+TransformFunction = Callable[[np.ndarray], np.ndarray]
 
-class ActorBuffer:
-    __slots__ = ('obs', 'actions', 'rewards', 'dones', 'len', 'cap')
-    obs: np.ndarray
-    actions: np.ndarray
-    rewards: np.ndarray
-    dones: np.ndarray
-    len: int
-    cap: int
-    n_steps: int
+
+class FrameStack:
+    __slots__ = 'frames', 'frame_stacking'
+    frames: np.ndarray
+    frame_stacking: Optional[int]
 
     def __init__(self,
-                 cap: int,
-                 obs_shape: Union[int, Tuple[int, ...]],
-                 obs_dtype: np.dtype = np.float32):
-        if isinstance(obs_shape, int):
-            obs_shape = obs_shape,
-        self.obs = np.zeros((cap, *obs_shape), dtype=obs_dtype)
-        self.actions = np.zeros(cap, dtype=np.int32)
-        self.rewards = np.zeros(cap, dtype=np.float32)
-        self.dones = np.zeros(cap, dtype=np.bool)
-        self.cap = cap
-        self.len = 0
+                 first_obs: np.ndarray,
+                 frame_stacking: Optional[int] = None):
+        self.frame_stacking = frame_stacking
+        if frame_stacking is None:
+            self.frames = first_obs
+        else:
+            self.frames = np.repeat(np.expand_dims(first_obs, 0),
+                                    frame_stacking, 0)
 
-    def push(self, obs: np.ndarray, action: int, reward: float, done: bool):
-        i = self.len
-        self.len += 1
-        self.obs[i] = obs
-        self.actions[i] = action
-        self.rewards[i] = reward
-        self.dones[i] = done
-        return i
-
-    def can_send(self) -> bool:
-        return self.len == self.cap
-
-    def clear(self):
-        self.len = 0
+    def update(self, done: bool, next_obs: np.ndarray):
+        if self.frame_stacking is None:
+            self.frames = next_obs
+        elif done:
+            self.frames[:] = next_obs
+        else:
+            self.frames[0] = next_obs
+            self.frames = np.roll(self.frames, -1, 0)
 
 
-class RecurrentActorBuffer(ActorBuffer):
-    __slots__ = 'mem'
-    mem: Tuple[np.ndarray, ...]
+class VecFrameStack:
+    __slots__ = 'frames', 'frame_stacking'
+    frames: np.ndarray
+    frame_stacking: Optional[int]
 
     def __init__(self,
-                 cap: int,
-                 obs_shape: Union[int, Tuple[int, ...]],
-                 mem_shape: Tuple[Union[int, Tuple[int, ...]], ...],
-                 obs_dtype: np.dtype = np.float32):
-        super().__init__(cap, obs_shape, obs_dtype)
-        mem = []
-        for shape in mem_shape:
-            if isinstance(shape, int):
-                shape = shape,
-            mem.append(np.zeros((cap, *shape), dtype=np.float32))
-        self.mem = tuple(mem)
+                 first_obs: np.ndarray,
+                 frame_stacking: Optional[int] = None):
+        self.frame_stacking = frame_stacking
+        if frame_stacking is None:
+            self.frames = first_obs
+        else:
+            self.frames = np.repeat(np.expand_dims(first_obs, 1),
+                                    frame_stacking, 1)
 
-    def push(self,
-             obs: np.ndarray,
-             action: int,
-             reward: float,
-             done: bool,
-             mem: Tuple[torch.Tensor, ...] = None):
-        if mem is None:
-            raise TypeError
-        i = super().push(obs, action, reward, done)
-        for j, m in enumerate(mem):
-            self.mem[j][i] = m.cpu().numpy()
+    def update(self, dones: np.ndarray, next_obs: np.ndarray):
+        if self.frame_stacking is None:
+            self.frames = next_obs
+        else:
+            self.frames[dones] = np.expand_dims(next_obs[dones], axis=1)
+            not_dones = ~dones
+            self.frames[not_dones, 0] = next_obs[not_dones]
+            self.frames[not_dones] = np.roll(self.frames[not_dones], -1, 1)
 
 
 class ReplayBuffer:
-    __slots__ = ('obs', 'actions', 'rewards', 'masks', 'reward_scaling', 'cap',
-                 'lens', 'current_indices', 'n_steps', 'discount')
+    __slots__ = ('obs', 'actions', 'rewards', 'masks', 'multi_masks', 'reward_scaling', 'cap',
+                 'lens', 'current_indices', 'n_steps', 'discount',
+                 'compress_fn', 'decompress_fn')
     # Buffers
     obs: np.ndarray
     actions: np.ndarray
     rewards: np.ndarray
     masks: np.ndarray
+    multi_masks: np.ndarray
     # Hyper Params
     reward_scaling: float
     cap: int
@@ -91,6 +76,8 @@ class ReplayBuffer:
     # Buffer info
     lens: np.ndarray
     current_indices: np.ndarray
+    compress_fn: TransformFunction
+    decompress_fn: TransformFunction
 
     def __init__(self,
                  num_envs: int,
@@ -99,13 +86,16 @@ class ReplayBuffer:
                  obs_dtype: np.dtype = np.float32,
                  reward_scaling: float = REWARD_SCALING,
                  n_steps: int = N_STEPS,
-                 discount: float = DISCOUNT):
+                 discount: float = DISCOUNT,
+                 compress_fn: TransformFunction = None,
+                 decompress_fn: TransformFunction = None):
         if isinstance(obs_shape, int):
             obs_shape = obs_shape,
         self.obs = np.zeros((num_envs, cap, *obs_shape), dtype=obs_dtype)
         self.actions = np.zeros((num_envs, cap), dtype=np.int32)
         self.rewards = np.zeros((num_envs, cap), dtype=np.float32)
         self.masks = np.zeros((num_envs, cap), dtype=np.bool)
+        self.multi_masks = np.zeros((num_envs, cap), dtype=np.bool)
 
         self.cap = cap
         self.n_steps = n_steps
@@ -113,11 +103,10 @@ class ReplayBuffer:
         self.current_indices = np.zeros(num_envs, dtype=np.int32)
         self.reward_scaling = reward_scaling
         self.discount = discount
-
-    def load(self, env_id: int, buff: ActorBuffer):
-        for i in range(buff.len):
-            self.push(env_id, buff.obs[i], buff.actions[i], buff.rewards[i],
-                      buff.dones[i])
+        self.compress_fn = (
+            lambda x: x) if compress_fn is None else compress_fn
+        self.decompress_fn = (
+            lambda x: x) if decompress_fn is None else decompress_fn
 
     @property
     def num_envs(self):
@@ -136,36 +125,67 @@ class ReplayBuffer:
                      steps: int = 1) -> Tuple[np.ndarray, np.ndarray]:
         return indices[0], (indices[1] + steps) % self.lens[indices[0]]
 
-    def push(self, env_id: int, obs: np.ndarray, action: int, reward: float,
-             done: bool) -> int:
+    def push(self,
+             env_id: int,
+             obs: np.ndarray,
+             action: int,
+             reward: float,
+             done: bool,
+             compress: bool = True) -> int:
         if self.lens[env_id] < self.cap:
             self.lens[env_id] += 1
         idx = self.current_indices[env_id]
         self.current_indices[env_id] += 1
         self.current_indices[env_id] %= self.cap
 
-        self.obs[env_id, idx] = obs
+        self.obs[env_id, idx] = self.compress_fn(obs) if compress else obs
         self.actions[env_id, idx] = action
         reward /= self.reward_scaling
         self.rewards[env_id, idx] = reward
         for i in range(1, self.n_steps):
-            if not self.masks[env_id, idx - i]:
+            if not self.multi_masks[env_id, idx - i]:
                 break
             reward *= self.discount
             self.rewards[env_id, idx - i] += reward
         mask = not done
         self.masks[env_id, idx] = mask
+        self.multi_masks[env_id, idx] = mask
         for i in range(1, self.n_steps):
-            self.masks[env_id, idx - i] &= mask
+            self.multi_masks[env_id, idx - i] &= mask
         return idx
 
+    def get_obs(
+        self,
+        indices: Tuple[np.ndarray, np.ndarray],
+        frame_stacking: Optional[int] = None
+    ) -> Tuple[np.ndarray, Tuple[np.ndarray, np.ndarray]]:
+        if frame_stacking is None:
+            obs = self.obs[indices]
+        else:
+            batch_size: int = indices[0].shape[0]
+            obs = np.empty((batch_size, frame_stacking, *self.obs.shape[2:]),
+                           dtype=self.obs.dtype)
+            for i in range(frame_stacking):
+                if i:
+                    dones = ~self.masks[indices]
+                    obs[dones, :i] = np.expand_dims(
+                        self.obs[indices[0][dones], indices[1][dones]], axis=1)
+                    indices = self.next_indices(indices)
+                obs[:, i] = self.obs[indices]
+        return self.decompress_fn(obs), indices
+
     def get_data(
-            self, indices: Tuple[np.ndarray,
-                                 np.ndarray]) -> Tuple[np.ndarray, ...]:
+        self,
+        indices: Tuple[np.ndarray, np.ndarray],
+        frame_stacking: Optional[int] = None,
+    ) -> Tuple[np.ndarray, ...]:
         next_indices = self.next_indices(indices, self.n_steps)
-        return (self.obs[indices], self.actions[indices],
-                self.rewards[indices], self.masks[indices],
-                self.obs[next_indices])
+
+        obs, indices = self.get_obs(indices, frame_stacking)
+        next_obs, next_indices = self.get_obs(next_indices, frame_stacking)
+
+        return (obs, self.actions[indices], self.rewards[indices],
+                self.multi_masks[indices], next_obs)
 
     def first_index(self, env_id: int) -> int:
         if self.lens[env_id] != self.cap:
@@ -194,9 +214,11 @@ class ReplayBuffer:
     def sample(self,
                rng: random.Generator,
                batch_size: int,
-               ex_steps: int = 0):
-        indices = self.sample_indices(rng, batch_size, ex_steps)
-        return (*self.get_data(indices), indices)
+               ex_steps: int = 0,
+               frame_stacking: int = None):
+        frame_steps = 0 if frame_stacking is None else (frame_stacking - 1)
+        indices = self.sample_indices(rng, batch_size, ex_steps + frame_steps)
+        return (*self.get_data(indices, frame_stacking), indices)
 
 
 class PrioritisedReplayBuffer(ReplayBuffer):
@@ -216,14 +238,16 @@ class PrioritisedReplayBuffer(ReplayBuffer):
                  reward_scaling: float = REWARD_SCALING,
                  n_steps: int = N_STEPS,
                  discount: float = DISCOUNT,
+                 compress_fn: TransformFunction = None,
+                 decompress_fn: TransformFunction = None,
                  alpha: float = PRIORITY_ALPHA,
                  beta: float = PRIORITY_BETA):
         if isinstance(obs_shape, int):
             obs_shape = obs_shape,
         super().__init__(num_envs, cap, obs_shape, obs_dtype, reward_scaling,
-                         n_steps, discount)
+                         n_steps, discount, compress_fn, decompress_fn)
         self.priorities = tuple(SumTree(cap) for _ in range(num_envs))
-        self.max_priority = 5.
+        self.max_priority = 2.
 
         self.alpha = alpha
         self.beta = beta
@@ -237,22 +261,28 @@ class PrioritisedReplayBuffer(ReplayBuffer):
              action: int,
              reward: float,
              done: bool,
-             err: float = None) -> int:
+             err: float = None,
+             compress: bool = True) -> int:
         if err is not None:
             priority = self._get_priority(err)
             self.max_priority = max(self.max_priority, priority)
         else:
             priority = self.max_priority
-        idx = super().push(env_id, obs, action, reward, done)
+        idx = super().push(env_id, obs, action, reward, done, compress)
         self.priorities[env_id][idx] = priority
         return idx
 
     def update_priorities(self, indices: Tuple[Iterable[int], Iterable[int]],
-                          errs: Iterable[float]):
-        for env_id, i, err in zip(indices[0], indices[1], errs):
-            priority = self._get_priority(err)
-            self.max_priority = max(self.max_priority, priority)
-            self.priorities[env_id][i] = priority
+                          errs: np.ndarray):
+        priorities = self._get_priority(errs)
+        max_priority = priorities.max()
+        if max_priority < self.max_priority:
+            self.max_priority *= MAX_PRIORITY_ADAPT_SPEED
+            self.max_priority += (1 - MAX_PRIORITY_ADAPT_SPEED) * max_priority
+        else:
+            self.max_priority = max_priority
+        for env_id, i, p in zip(indices[0], indices[1], priorities):
+            self.priorities[env_id][i] = p
 
     def total_priorities(self) -> float:
         return sum(priorities.total() for priorities in self.priorities)
@@ -311,8 +341,11 @@ class PrioritisedReplayBuffer(ReplayBuffer):
     def sample(self,
                rng: random.Generator,
                batch_size: int,
-               ex_steps: int = 0):
-        weights, indices = self.sample_indices(rng, batch_size, ex_steps)
+               ex_steps: int = 0,
+               frame_stacking: int = None):
+        frame_steps = 0 if frame_stacking is None else (frame_stacking - 1)
+        weights, indices = self.sample_indices(rng, batch_size,
+                                               ex_steps + frame_steps)
         return (*self.get_data(indices), weights, indices)
 
 
@@ -329,10 +362,13 @@ class RecurrentPrioritisedExperienceReplay(PrioritisedReplayBuffer):
                  reward_scaling: float = REWARD_SCALING,
                  n_steps: int = N_STEPS,
                  discount: float = DISCOUNT,
+                 compress_fn: TransformFunction = None,
+                 decompress_fn: TransformFunction = None,
                  alpha: float = PRIORITY_ALPHA,
                  beta: float = PRIORITY_BETA):
         super().__init__(num_envs, cap, obs_shape, obs_dtype, reward_scaling,
-                         n_steps, discount, alpha, beta)
+                         n_steps, discount, compress_fn, decompress_fn, alpha,
+                         beta)
         mem = []
         for shape in mem_shape:
             if isinstance(shape, int):
@@ -347,53 +383,47 @@ class RecurrentPrioritisedExperienceReplay(PrioritisedReplayBuffer):
              reward: float,
              done: bool,
              err: float = None,
-             mem: Tuple[np.ndarray, ...] = None) -> int:
+             mem: List[np.ndarray] = None,
+             compress: bool = True) -> int:
         if mem is None:
             raise TypeError
-        idx = super().push(env_id, obs, action, reward, done, err)
+        idx = super().push(env_id, obs, action, reward, done, err, compress)
         for i, m in enumerate(mem):
             self.mem[i][env_id, idx] = m
         return idx
 
-    def load(self, env_id: int, buff: RecurrentActorBuffer):
-        for i in range(buff.len):
-            self.push(env_id,
-                      buff.obs[i],
-                      buff.actions[i],
-                      buff.rewards[i],
-                      buff.dones[i],
-                      mem=tuple(m[i] for m in buff.mem))
-
-    def update_memory(self, indices: np.ndarray, mem: Tuple[np.ndarray, ...]):
+    def update_memory(self, indices: np.ndarray, mem: List[np.ndarray]):
         for i, m in enumerate(mem):
             self.mem[i][indices] = m
 
     def get_data(self,
                  indices: Tuple[np.ndarray, np.ndarray],
                  get_mem: bool = True,
-                 minimal: bool = False):
+                 frame_stacking: Optional[int] = None):
         next_indices = self.next_indices(indices, self.n_steps)
+
+        obs, indices = self.get_obs(indices, frame_stacking)
+        next_obs, next_indices = self.get_obs(next_indices, frame_stacking)
+
         if get_mem:
-            mem = tuple(m[indices] for m in self.mem)
-            next_mem = tuple(m[next_indices] for m in self.mem)
-            if minimal:
-                return mem, self.obs[indices], next_mem, self.obs[next_indices]
-            else:
-                return (mem, self.obs[indices], self.actions[indices],
-                        self.rewards[indices], self.masks[indices], next_mem,
-                        self.obs[next_indices])
-        elif minimal:
-            return self.obs[indices], self.obs[next_indices]
+            mem = [m[indices] for m in self.mem]
+            next_mem = [m[next_indices] for m in self.mem]
+            return (mem, obs, self.actions[indices], self.masks[indices],
+                    self.rewards[indices], self.multi_masks[indices], next_mem,
+                    next_obs, self.masks[next_indices])
         else:
-            return (self.obs[indices], self.actions[indices],
-                    self.rewards[indices], self.masks[indices],
-                    self.obs[next_indices])
+            return (obs, self.actions[indices], self.masks[indices],
+                    self.rewards[indices], self.multi_masks[indices], next_obs,
+                    self.masks[next_indices])
 
     def sample(self,
                rng: random.Generator,
                batch_size: int,
                ex_steps: int = 0,
-               get_mem: bool = True,
-               minimal: bool = False):
-        weights, indices = self.sample_indices(rng, batch_size, ex_steps)
-        return (*self.get_data(indices, get_mem, minimal), weights, indices)
+               frame_stacking: int = None,
+               get_mem: bool = True):
+        frame_steps = 0 if frame_stacking is None else (frame_stacking - 1)
+        weights, indices = self.sample_indices(rng, batch_size,
+                                               ex_steps + frame_steps)
+        return (*self.get_data(indices, get_mem, frame_stacking), weights,
+                indices)

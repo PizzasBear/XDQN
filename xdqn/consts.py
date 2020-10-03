@@ -1,10 +1,10 @@
 # Q-Learning
-TRANSFORMED_BELLMAN: bool = True
+TRANSFORMED_BELLMAN: bool = False
 DISCOUNT: float = 0.99
 EPSILON_HIGH: float = 0.5
 EPSILON_LOW: float = 0.1
 EPSILON_DECAY: float = 8e-4
-REWARD_SCALING: float = 5.
+REWARD_SCALING: float = 1.
 TARGET_UPDATE_INTERVAL: int = 1_500
 # Deep
 LEARNING_RATE: float = 3e-4
@@ -16,8 +16,12 @@ PRIORITY_MEAN_MAX: float = 0.9
 PRIORITY_ALPHA: float = 0.9
 PRIORITY_BETA: float = 0.6
 MIN_REPLAY_LEN: int = 4_000
+MAX_PRIORITY_ADAPT_SPEED: float = 0.01
 # Extras
 N_STEPS: int = 3
 NUM_QUANTILES: int = 50
-RECURRENT_STEPS: int = 30
-BURN_IN_STEPS: int = 10
+RECURRENT_STEPS: int = 20
+BURN_IN_STEPS: int = 0
+# Epsilon Greedy
+BASE_EPSILON: float = 0.4
+EPSILON_ALPHA: float = 7.

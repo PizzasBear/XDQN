@@ -1,169 +1,138 @@
 from xdqn import nets, algo, distrib, buffers
-import traceback
-from typing import Dict, Optional
+from typing import Optional, Union, Tuple
 from datetime import datetime
 from itertools import count
 import numpy as np
 from numpy import random
 import torch
 from torch.utils.tensorboard import SummaryWriter
-import torch.multiprocessing as mp
-from multiprocessing.connection import Connection
 import gym
+import gym.wrappers
+from xdqn.consts import *
 
-NUM_ACTORS: int = 10
-ACTOR_UPDATE_INTERVAL: int = 293
-SAVE_INTERVAL: int = 1000
-REPLAY_BUFFER_UPDATE_INTERVAL: int = 223
-IN_FEATURES: int = 8
-NUM_ACTIONS: int = 4
-ENV_ID: str = 'LunarLander-v2'
-LEARNER_DEVICE: str = 'cuda'
-ACTOR_DEVICE: str = 'cpu'
-LOG_DIR: str = 'lunar-lander/'
-MODEL_FILE: str = 'lunar-lander.pt'
-BASE_EPSILON: float = 0.4
-EPSILON_ALPHA: float = 7.
+# Environment
+ENV_ID: str = 'BreakoutNoFrameskip-v4'
+FRAME_STACKING: Optional[int] = 4
+COMPRESSED_OBS_SHAPE: Union[int, Tuple[int, ...]] = (84, 84)
+COMPRESSED_OBS_DTYPE: np.dtype = np.uint8
+PROC_FEATURES_SHAPE: Tuple[int, ...] = (FRAME_STACKING, 84, 84)
+NUM_ENVS: int = 10
+FIRE_INTERVAL: int = 200
+
+# Storage info
+SAVE_INTERVAL: int = 1500
+DEVICE: str = 'cuda'
+LOG_DIR: str = 'breakout/'
+MODEL_FILE: str = 'breakout.pt'
 CONTINUE: bool = False
 
 
 def make_env():
-    return gym.make(ENV_ID)
+    return gym.wrappers.AtariPreprocessing(gym.make(ENV_ID), terminal_on_life_loss=True)
 
 
-def make_net(in_features: int, num_actions: int):
+def make_net(num_actions: int):
+    feature_net = nets.ConvNet([(32, 8, 4), (64, 4, 2), (64, 3, 1)], 4, True)
+    feature_net_out_size = feature_net(torch.zeros(
+        1, *PROC_FEATURES_SHAPE)).size()[-1]
     net = nets.QuantileDuelingQNet(
-        feature_net=nets.MLP([64], in_features),
-        memory_net=nets.LSTM([64], 64),
-        value_net=nets.MLP([48], 64, out_features=algo.NUM_QUANTILES),
-        advantage_net=nets.MLP([48],
-                               64,
+        feature_net=feature_net,
+        memory_net=nets.LSTM([512], feature_net_out_size),
+        value_net=nets.MLP([512], 512, out_features=algo.NUM_QUANTILES),
+        advantage_net=nets.MLP([512],
+                               512,
                                out_features=num_actions * algo.NUM_QUANTILES),
     )
     return net
 
 
-def actor_proc(conn: Connection, epsilon: Optional[float] = None):
-    try:
-        actor = algo.Actor(make_net(IN_FEATURES, NUM_ACTIONS)).to(ACTOR_DEVICE)
-        actor.load_state_dict(conn.recv())
-        rng: random.Generator = random.default_rng()
-        env: gym.Env = make_env()
-        obs: np.ndarray = env.reset()
-        mem = actor.init_mem(1, 'cpu')
-
-        buffer = buffers.RecurrentActorBuffer(
-            REPLAY_BUFFER_UPDATE_INTERVAL,
-            IN_FEATURES,
-            actor.mem_size(),
-        )
-
-        can_send_fitness = False
-        fitness = 0.
-        while True:
-            # Play
-            action, mem = actor.act(mem,
-                                    obs,
-                                    rng,
-                                    ACTOR_DEVICE,
-                                    epsilon=epsilon)
-            next_obs, reward, done, _ = env.step(action)
-
-            # Send
-            if buffer.can_send():
-                conn.send(('buffer', buffer))
-                buffer.clear()
-
-            buffer.push(obs, action, reward, done, mem)
-
-            # Update obs and fitness
-            fitness += reward
-            if done:
-                mem = actor.init_mem(1, 'cpu')
-                if can_send_fitness:
-                    conn.send(('fitness', fitness))  # send fitness
-                next_obs = env.reset()
-                fitness = 0.
-            obs = next_obs
-
-            if conn.poll(0):
-                key, value = conn.recv()
-                if key == 'net':
-                    actor.load_state_dict(value)
-                elif key == 'send_fitness':
-                    can_send_fitness = True
-                else:
-                    raise RuntimeError
-    except Exception as e:
-        conn.send(('except', (e, traceback.format_exc())))
+def common_pre_proc(obs: np.ndarray) -> np.ndarray:
+    return obs
 
 
-def state_dict_to_cpu(
-        state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-    for k, v in state_dict.items():
-        state_dict[k] = v.cpu()
-    return state_dict
+def pre_proc(obs: np.ndarray) -> np.ndarray:
+    return obs
 
 
-def learner_proc(conn: distrib.MultiConnection):
-    net = make_net(IN_FEATURES, NUM_ACTIONS)
-    if CONTINUE:
-        net.load_state_dict(torch.load('models/' + MODEL_FILE))
-    agent = algo.Agent(
-        net,
-        make_net(IN_FEATURES, NUM_ACTIONS),
-        NUM_ACTORS,
-        IN_FEATURES,
-        net.mem_size(),
-        num_quantiles=algo.NUM_QUANTILES,
-    ).to(LEARNER_DEVICE)
-    conn.send(state_dict_to_cpu(agent.net_state_dict()))
+def frame_stack_pre_proc(obs: np.ndarray) -> np.ndarray:
+    return obs.astype(np.float32) / 256.
 
+
+def compress(obs: np.ndarray) -> np.ndarray:
+    return obs
+
+
+def decompress(obs: np.ndarray) -> np.ndarray:
+    return obs.astype(np.float32) / 256.
+
+
+def main():
     log_dir: str = 'data/logs/' + LOG_DIR + datetime.now().strftime(
         '%Y%m%d-%H%M%S')
     writer: SummaryWriter = SummaryWriter(log_dir)
     rng: random.Generator = random.default_rng()
 
-    # collect experience 'till the agent can learn
-    while not agent.can_learn():
-        idx, (key, value) = conn.recv()
-        if key == 'buffer':
-            agent.load(idx, value)
-        elif key == 'except':
-            print(value[1])
-            raise value[0]
-    conn.send(('send_fitness', None))
-    # start the learning loop
-    for t in count(1):
-        agent.learn(t, writer, rng, LEARNER_DEVICE)
-        # update the actor
-        if not t % ACTOR_UPDATE_INTERVAL:
-            conn.send(('net', state_dict_to_cpu(agent.net_state_dict())))
+    envs = distrib.MPVecEnv(make_env, NUM_ENVS)
+
+    epsilon = BASE_EPSILON**(1 +
+                             EPSILON_ALPHA * np.flip(np.arange(NUM_ENVS), 0) /
+                             (NUM_ENVS - 2))
+    epsilon[0] = 0
+
+    net = make_net(envs.action_space.n)
+    if CONTINUE:
+        net.load_state_dict(
+            torch.load('models/' + MODEL_FILE, map_location=DEVICE))
+    agent = algo.Agent(
+        net,
+        make_net(envs.action_space.n),
+        NUM_ENVS,
+        COMPRESSED_OBS_SHAPE,
+        net.mem_size(),
+        obs_dtype=COMPRESSED_OBS_DTYPE,
+        num_quantiles=algo.NUM_QUANTILES,
+        compress_fn=compress,
+        decompress_fn=decompress,
+        frame_stacking=FRAME_STACKING,
+    ).to(DEVICE)
+
+    fitness = np.zeros(NUM_ENVS)
+
+    obs = common_pre_proc(envs.reset())
+    frame_stack = buffers.VecFrameStack(obs, FRAME_STACKING)
+    mem = agent.get_init_mem(NUM_ENVS)
+    for t in count():
         if not t % SAVE_INTERVAL:
             torch.save(agent.net_state_dict(), 'models/' + MODEL_FILE)
-        # collect experience
-        if conn.poll(0):
-            idx, (key, value) = conn.recv()
-            if key == 'buffer':
-                agent.load(idx, value)
-            elif key == 'fitness':
-                writer.add_scalar('Fitness', value, t)
-            elif key == 'except':
-                print(value[1])
-                raise value[0]
+        t *= NUM_ENVS
+        actions, next_mem = agent.act(mem,
+                                      frame_stack_pre_proc(frame_stack.frames),
+                                      rng,
+                                      device=DEVICE,
+                                      epsilon=epsilon)
+        if not t % FIRE_INTERVAL:
+            actions.fill(1)
+        envs.step_async(actions)
+        if agent.can_learn():
+            agent.learn(t, writer, rng, DEVICE)
+        next_obs, rewards, dones = envs.await_step()
+        next_obs = common_pre_proc(next_obs)
+        for i in range(NUM_ENVS):
+            agent.store(i, [m[i] for m in mem], obs[i], actions[i], rewards[i],
+                        dones[i])
 
-
-def main():
-    actor_conns, learner_conns = distrib.MultiPipe(NUM_ACTORS)
-    actor_epsilons = BASE_EPSILON**(1 + np.arange(NUM_ACTORS) * EPSILON_ALPHA /
-                                    (NUM_ACTORS - 1))
-    actor_handles = [
-        mp.Process(target=actor_proc, args=(conn, epsilon), daemon=True)
-        for conn, epsilon in zip(actor_conns, actor_epsilons)
-    ]
-    for actor_handle in actor_handles:
-        actor_handle.start()
-    learner_proc(distrib.MultiConnection(learner_conns))
+        # Update obs and fitness
+        mem = algo.mask_mem(torch.tensor(dones, device=DEVICE),
+                            agent.get_init_mem(NUM_ENVS), next_mem)
+        fitness += rewards
+        for i, done in enumerate(dones):
+            if done:
+                if i == 0:
+                    writer.add_scalar('Eval Fitness', fitness[0], t + i)
+                writer.add_scalar('Fitness', fitness[i], t + i)
+                fitness[i] = 0.
+        frame_stack.update(dones, pre_proc(next_obs))
+        obs = next_obs
 
 
 if __name__ == '__main__':

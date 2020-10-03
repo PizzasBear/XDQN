@@ -49,11 +49,11 @@ class MLP(nn.Module):
 
 # noinspection PyAbstractClass
 class LSTM(nn.Module):
-    __slots__ = 'layers', 'in_features', 'out_features'
-
+    __slots__ = 'layers', 'in_features', 'out_features', 'init_state'
     in_features: int
     out_features: int
     layers: nn.ModuleList
+    init_state: nn.ParameterList
 
     def __init__(self,
                  layer_sizes: List[int],
@@ -66,10 +66,19 @@ class LSTM(nn.Module):
 
         self.in_features = in_features
         self.layers = nn.ModuleList()
+        self.init_state = nn.ParameterList()
         prev_features = in_features
         for size in layer_sizes:
             layer = nn.LSTMCell(prev_features, size)
             self.layers.append(layer)
+
+            init_h = torch.empty(1, size)
+            nn.init.xavier_uniform_(init_h)
+            init_c = torch.empty(1, size)
+            nn.init.xavier_uniform_(init_c)
+            self.init_state.extend(
+                (nn.Parameter(init_h), nn.Parameter(init_c)))
+
             self.layers.append(activation)
             prev_features = size
 
@@ -83,48 +92,34 @@ class LSTM(nn.Module):
                 prev_features, _ = prev_features
         self.out_features = prev_features
 
-    def mem_size(self) -> Tuple[int, ...]:
-        return tuple(layer.hidden_size for layer in self.layers
-                     if isinstance(layer, nn.LSTMCell) for _ in range(2))
+    def mem_size(self) -> List[int]:
+        return [
+            layer.hidden_size for layer in self.layers
+            if isinstance(layer, nn.LSTMCell) for _ in range(2)
+        ]
 
-    def init_mem(self,
-                 batch_size: int,
-                 device: Device = None) -> Tuple[torch.Tensor, ...]:
-        mem = []
-        for layer in self.layers:
-            if isinstance(layer, nn.LSTMCell):
-                mem.append(
-                    torch.zeros((batch_size, layer.hidden_size)
-                                if batch_size else layer.hidden_size,
-                                dtype=torch.float32,
-                                device=device))
-                mem.append(
-                    torch.zeros((batch_size, layer.hidden_size)
-                                if batch_size else layer.hidden_size,
-                                dtype=torch.float32,
-                                device=device))
-        return tuple(mem)
+    def get_init_mem(self, batch_size: int) -> List[torch.Tensor]:
+        return [m.expand(batch_size, -1) for m in self.init_state]
 
     def forward(
-        self, x: torch.Tensor, mem: Tuple[torch.Tensor, ...]
-    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, ...]]:
-        mem_1 = []
+            self, x: torch.Tensor, mem: List[torch.Tensor]
+    ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+        new_mem = []
         i = 0
         for layer in self.layers:
             if isinstance(layer, nn.LSTMCell):
                 x, c = layer(x, (mem[i], mem[i + 1]))
-                mem_1.append(x)  # hidden state
-                mem_1.append(c)  # cell state
+                new_mem.append(x)  # hidden state
+                new_mem.append(c)  # cell state
                 i += 2
             else:
                 x = layer(x)
-        return x, tuple(mem_1)
+        return x, new_mem
 
 
 # noinspection PyAbstractClass
 class ConvNet(nn.Module):
     __slots__ = 'layers',
-
     layers: nn.ModuleList
 
     def __init__(self,
@@ -178,10 +173,8 @@ class DuelingQNet(nn.Module):
     def mem_size(self) -> Tuple[int, ...]:
         return self.memory_net.mem_size()
 
-    def init_mem(self,
-                 batch_size: int,
-                 device: Device = None) -> Tuple[torch.Tensor, ...]:
-        return self.memory_net.init_mem(batch_size, device)
+    def get_init_mem(self, batch_size: int) -> List[torch.Tensor]:
+        return self.memory_net.get_init_mem(batch_size)
 
     def remember(self, x: torch.Tensor,
                  mem: Tuple[torch.Tensor, ...]) -> Tuple[torch.Tensor, ...]:
@@ -211,8 +204,8 @@ class QuantileDuelingQNet(DuelingQNet):
     def forward(
         self,
         x: torch.Tensor,
-        mem: Optional[Tuple[torch.Tensor, ...]] = None
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, Tuple[torch.Tensor, ...]]]:
+        mem: Optional[List[torch.Tensor]] = None
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, List[torch.Tensor]]]:
         features: torch.Tensor = self.features_net(x)
         if self.memory_net is not None:
             features, mem = self.memory_net(features, mem)
